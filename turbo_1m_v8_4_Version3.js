@@ -549,14 +549,14 @@
 
   // ─── signal list + TP/SL ─────────────────────────────────────────────────
 
-  // v8.5-fix: buildSignalList teraz niesie avgPrice i units z position state
-  function buildSignalList(buyIdx, sellIdx, buyPrice, sellPrice, close, avgPrices, unitCounts) {
+  // v8.5-fix: buildSignalList niesie avgPrice i units z position state — oddzielne tablice buy/sell
+  function buildSignalList(buyIdx, sellIdx, buyPrice, sellPrice, close, buyAvgPrices, sellAvgPrices, buyUnitCounts, sellUnitCounts) {
     const list=[];
     if (Array.isArray(buyIdx)) for (let i=0;i<buyIdx.length;i++) {
       const idx=Number(buyIdx[i]); if (!Number.isFinite(idx)) continue;
       const p=Number(buyPrice?.[i]);
-      const avg=avgPrices?.[i];
-      const units=unitCounts?.[i];
+      const avg=buyAvgPrices?.[i];
+      const units=buyUnitCounts?.[i];
       list.push({
         idx: Math.trunc(idx),
         dir: 1,
@@ -568,15 +568,14 @@
     if (Array.isArray(sellIdx)) for (let i=0;i<sellIdx.length;i++) {
       const idx=Number(sellIdx[i]); if (!Number.isFinite(idx)) continue;
       const p=Number(sellPrice?.[i]);
-      const avg=avgPrices?.[sellIdx.length ? i : i]; // offset nie potrzebny, osobne tablice
-      const avgOff = avgPrices ? avgPrices[buyIdx.length + i] : undefined;
-      const unitsOff = unitCounts ? unitCounts[buyIdx.length + i] : undefined;
+      const avg=sellAvgPrices?.[i];
+      const units=sellUnitCounts?.[i];
       list.push({
         idx: Math.trunc(idx),
         dir: -1,
         price: Number.isFinite(p) ? p : Number(close[idx]),
-        avgPrice: Number.isFinite(avgOff) ? avgOff : (Number.isFinite(p) ? p : Number(close[idx])),
-        units: Number.isFinite(unitsOff) && unitsOff > 0 ? unitsOff : 1
+        avgPrice: Number.isFinite(avg) ? avg : (Number.isFinite(p) ? p : Number(close[idx])),
+        units: Number.isFinite(units) && units > 0 ? units : 1
       });
     }
     list.sort((a,b)=>a.idx-b.idx); return list;
@@ -1063,9 +1062,11 @@
       const triggerWeights = { trend: 0, breakout: 0, burst: 0 };
       const contextWeights = { rsi: 0, volume: 0, atr: 0, fib: 0, expansion: 0, wick: 0, vwap: 0, delta: 0 };
 
+      // NaN emaFast/emaSlow → trendOk = false (brak danych nie przepuszcza sygnału)
       const trendOk = dir === 1 ? emaFast[i] > emaSlow[i] : emaFast[i] < emaSlow[i];
+      // NaN emaFast[i] lub emaFast[i-1] → slopeOk = false (brak danych nie przepuszcza sygnału)
       const slopeOk = (Number.isFinite(emaFast[i]) && Number.isFinite(emaFast[i - 1]))
-        ? (dir === 1 ? emaFast[i] > emaFast[i - 1] : emaFast[i] < emaFast[i - 1]) : true;
+        ? (dir === 1 ? emaFast[i] > emaFast[i - 1] : emaFast[i] < emaFast[i - 1]) : false;
       if (trendOk && slopeOk) triggerWeights.trend = WEIGHTS.trend;
 
       if (Number.isFinite(atr[i]) && Number.isFinite(refPrice) && Math.abs(close[i] - refPrice) >= atr[i] * 0.05)
@@ -1153,10 +1154,7 @@
     let tpIdx = [], tpPrice = [], slIdx = [], slPrice = [];
     const tpMode  = normalizeTpSystem(cfg.tpSystem, DEFAULTS.tpSystem);
 
-    // v8.5: avgPrices i unitCounts — połączone tablice buy + sell
-    const avgPrices  = buyAvgPrice.concat(sellAvgPrice);
-    const unitCounts = buyUnits.concat(sellUnits);
-    const signals = buildSignalList(buyIdx, sellIdx, buyPrice, sellPrice, close, avgPrices, unitCounts);
+    const signals = buildSignalList(buyIdx, sellIdx, buyPrice, sellPrice, close, buyAvgPrice, sellAvgPrice, buyUnits, sellUnits);
 
     if (tpMode === 'classic') {
       const r = computeClassicTpSl(candles, signals, cfg.tpPercent, cfg.slPercent);
