@@ -759,6 +759,7 @@
     state.protectiveStop = NaN;
   }
 
+
   function registerEntry(state, dir, entryPrice, barIdx, atrVal) {
     if (!(dir === 1 || dir === -1) || !Number.isFinite(entryPrice)) return;
     if (state.currentSide !== dir || state.positionUnits <= 0 || !Number.isFinite(state.positionAvgPrice)) {
@@ -1116,7 +1117,9 @@
           manageMeta.push({ fromSide: state.currentSide, toSide: dir, stateBefore: cloneState(state) });
           if (cfg.debugSignals) pushDebug(debugSignals, Object.assign({ action: 'reverseClose', entryPrice: mgmtPrice }, blockedBase), cfg.debugMaxRecords);
           clearPositionOnly(state);
-          // Do NOT set lastExecutionBar here — let the new entry go through without old-position cooldown blocking it
+          // Reset lastExecutionBar so the cooldown check below doesn't block the immediate reverse entry.
+          // The new entry (registered further down) will set lastExecutionBar = entryIdx for future cooldown.
+          state.lastExecutionBar = -1e9;
           state.lastManagementBar = mgmtIdx;
           // Fall through to normal entry processing below (scoring, ADX filter, etc.)
         }
@@ -1342,6 +1345,9 @@
         warmupBars:               cfg.warmupBars,
         cooldown:                 cfg.cooldown,
         adxMin:                   cfg.adxMin,
+        adxLen:                   cfg.adxLen,
+        swingLen:                 cfg.swingLen,
+        breakByClose:             cfg.breakByClose,
         useMarketRegime:          cfg.useMarketRegime,
         ambiguousBarPolicy:       cfg.ambiguousBarPolicy,
         tpSystem:                 cfg.tpSystem,
