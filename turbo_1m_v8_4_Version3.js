@@ -39,6 +39,8 @@
 
     // --- Scoring ---
     minScore: 4.0,
+    minTriggerScore: 1.5, // minimalna suma wag trigger (trend+breakout+burst) wymagana do wygenerowania sygnału
+    warmupBars: 100,      // liczba początkowych barów pomijanych (warmup wskaźników); sugerowana: max lookback + ~10
     cooldown: 2,
 
     // --- Entry mode ---
@@ -939,6 +941,10 @@
     let lastBrokenHIdx = -1, lastBrokenLIdx = -1;
 
     for (let i = swing * 2; i < n; i++) {
+      if (i < cfg.warmupBars) {
+        if (cfg.debugSignals) pushDebug(debugBlocked, { idx: i, reason: 'warmupBars:warmup' }, cfg.debugMaxRecords);
+        continue;
+      }
       if (Number.isFinite(microHigh[i])) lastMH = { idx: i, price: microHigh[i] };
       if (Number.isFinite(microLow[i]))  lastML  = { idx: i, price: microLow[i] };
       if (!lastMH || !lastML || !Number.isFinite(close[i])) continue;
@@ -1114,8 +1120,12 @@
         if (ratio > cfg.deltaThreshold && (delta[i] > 0) === (dir === 1)) contextWeights.delta = WEIGHTS.delta;
       }
 
-      const score = Object.values(triggerWeights).reduce((a, b) => a + b, 0) +
-                    Object.values(contextWeights).reduce((a, b) => a + b, 0);
+      const triggerScore = Object.values(triggerWeights).reduce((a, b) => a + b, 0);
+      const score = triggerScore + Object.values(contextWeights).reduce((a, b) => a + b, 0);
+      if (triggerScore < cfg.minTriggerScore) {
+        if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'triggerScore:minTriggerScore', triggerScore, triggerWeights, contextWeights }, blockedBase), cfg.debugMaxRecords);
+        continue;
+      }
       if (score < cfg.minScore) {
         if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'score:minScore', score, triggerWeights, contextWeights }, blockedBase), cfg.debugMaxRecords);
         continue;
