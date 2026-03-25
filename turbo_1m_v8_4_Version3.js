@@ -1,4 +1,5 @@
 // TURBO 1M — Ultra-fast indicator for 1-minute candles (normal candles, NOT Heikin-Ashi)
+// v8.6.1 — audit-fix: lastMH/lastML independent (no longer both required); volume NaN preserved (not coerced to 0); pullback uses only low/high wick
 // v8.6 — S-tier: quality breakout (body+minDist+maxExt), add impulse confirm; v8.5: TP/SL od i+1, reset state pełny, NaN=0 w scoringu
 (function () {
   'use strict';
@@ -773,8 +774,12 @@
 
   function computePullbackOk(dir, i, close, low, high, emaFast) {
     if (!Number.isFinite(emaFast[i])) return true;
-    if (dir === 1) return (Number.isFinite(low[i]) && low[i] <= emaFast[i]) || close[i] <= emaFast[i];
-    return (Number.isFinite(high[i]) && high[i] >= emaFast[i]) || close[i] >= emaFast[i];
+    // audit-fix: use only the candle wick (low/high) to confirm a true pullback to EMA.
+    // Previously `|| close[i] <= emaFast[i]` was used as a fallback, but a close below
+    // EMA for a long (or above EMA for a short) is a deeper bearish/bullish move, not
+    // just a pullback — it should not automatically qualify as an add condition.
+    if (dir === 1) return Number.isFinite(low[i]) && low[i] <= emaFast[i];
+    return             Number.isFinite(high[i]) && high[i] >= emaFast[i];
   }
 
   function computeBreakoutOk(dir, closePrice, refPrice, state) {
@@ -919,7 +924,10 @@
       high[i]   = Number(c.high);
       low[i]    = Number(c.low);
       close[i]  = Number(c.close);
-      volume[i] = Number(c.volume || 0);
+      // audit-fix: preserve NaN for missing volume so smaSeries skips it instead
+      // of pulling volSma toward zero with artificial zeros.
+      const rawVol = Number(c.volume);
+      volume[i] = Number.isFinite(rawVol) ? rawVol : NaN;
     }
 
     const emaFast = emaSeries(close, cfg.fastEma);
@@ -957,10 +965,14 @@
       }
       if (Number.isFinite(microHigh[i])) lastMH = { idx: i, price: microHigh[i] };
       if (Number.isFinite(microLow[i]))  lastML  = { idx: i, price: microLow[i] };
-      if (!lastMH || !lastML || !Number.isFinite(close[i])) continue;
+      // audit-fix: require only the pivot relevant to the signal direction;
+      // previously both lastMH and lastML were required, which blocked all signals
+      // in strongly trending markets where one pivot type had not yet formed.
+      if (!Number.isFinite(close[i])) continue;
 
-      const highBreak = i > lastMH.idx && (cfg.breakByClose ? close[i] > lastMH.price : high[i] > lastMH.price);
-      const lowBreak  = i > lastML.idx  && (cfg.breakByClose ? close[i] < lastML.price : low[i]  < lastML.price);
+      const highBreak = lastMH != null && i > lastMH.idx && (cfg.breakByClose ? close[i] > lastMH.price : high[i] > lastMH.price);
+      const lowBreak  = lastML  != null && i > lastML.idx  && (cfg.breakByClose ? close[i] < lastML.price : low[i]  < lastML.price);
+      if (!highBreak && !lowBreak) continue;
       if (highBreak && lowBreak) continue;
 
       let dir = 0, refPrice = NaN;
