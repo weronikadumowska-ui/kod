@@ -1,4 +1,7 @@
 // TURBO 1M — Ultra-fast indicator for 1-minute candles (normal candles, NOT Heikin-Ashi)
+// v8.6.2 — audit-fix: closeThenWait preserves cooldown; reverseImmediately bypasses old-position cooldown;
+//   TP/SL preview aware of management closes; manageIdx uses resolveEntry entryIdx; ambiguousBarPolicy;
+//   computeBreakoutOk uses structural refPrice; computeDistanceOk uses lastAddAtr; expanded debugConfig
 // v8.6.1 — audit-fix: lastMH/lastML independent (no longer both required); volume NaN preserved (not coerced to 0); pullback uses only low/high wick
 // v8.6 — S-tier: quality breakout (body+minDist+maxExt), add impulse confirm; v8.5: TP/SL od i+1, reset state pełny, NaN=0 w scoringu
 (function () {
@@ -70,6 +73,7 @@
     slPercent: 0.25,
     tpAtrMult: 1.5,
     slAtrMult: 1.0,
+    ambiguousBarPolicy: 'closerToEntry', // 'closerToEntry' | 'conservative' (always SL) | 'optimistic' (always TP)
 
     // --- Market regime ---
     useMarketRegime: true,
@@ -589,16 +593,25 @@
     list.sort((a,b)=>a.idx-b.idx); return list;
   }
 
-  function _resolveHitSide(hitTp, hitSl, tpLevel, slLevel, entry) {
+  function _resolveHitSide(hitTp, hitSl, tpLevel, slLevel, entry, ambiguousBarPolicy) {
     if (!hitTp&&!hitSl) return null;
-    if (hitSl&&(!hitTp||Math.abs(slLevel-entry)<=Math.abs(tpLevel-entry))) return 'sl';
+    if (hitTp&&hitSl) {
+      const policy = ambiguousBarPolicy || 'closerToEntry';
+      if (policy === 'conservative') return 'sl';
+      if (policy === 'optimistic') return 'tp';
+      // default: closerToEntry — original behavior
+      if (Math.abs(slLevel-entry)<=Math.abs(tpLevel-entry)) return 'sl';
+      return 'tp';
+    }
+    if (hitSl) return 'sl';
     return 'tp';
   }
 
-  // v8.5-fix: TP/SL liczy od avgPrice, sprawdza od świecy NASTĘPNEJ po entry
-  function computeClassicTpSl(candles, signals, tpPct, slPct) {
+  // v8.6.2-fix: TP/SL preview aware of management closes (closeThenWait/reduceOnly→0)
+  function computeClassicTpSl(candles, signals, tpPct, slPct, managementCloses, ambiguousBarPolicy) {
     const tpIdx=[],tpPrice=[],slIdx=[],slPrice=[];
     if (!candles.length||(!(tpPct>0)&&!(slPct>0))) return {tpIdx,tpPrice,slIdx,slPrice};
+    const mgmtSet = new Set(Array.isArray(managementCloses) ? managementCloses : []);
     let pos=0,entry=NaN,entryBar=-1,sigPtr=0;
     for (let i=0;i<candles.length;i++) {
       while (sigPtr<signals.length&&signals[sigPtr].idx===i) {
@@ -608,6 +621,8 @@
         sigPtr++;
       }
       if (!pos||!Number.isFinite(entry)) continue;
+      // v8.6.2-fix: if management close happened on this bar, exit position in preview
+      if (mgmtSet.has(i)) { pos=0; entry=NaN; continue; }
       // v8.5-fix: nie sprawdzaj TP/SL na świecy wejścia
       if (i<=entryBar) continue;
       const hi=Number(candles[i].high),lo=Number(candles[i].low);
@@ -615,17 +630,18 @@
       let tpLevel,slLevel,hitTp,hitSl;
       if (pos===1) { tpLevel=tpPct>0?entry*(1+tpPct/100):NaN; slLevel=slPct>0?entry*(1-slPct/100):NaN; hitTp=Number.isFinite(tpLevel)&&hi>=tpLevel; hitSl=Number.isFinite(slLevel)&&lo<=slLevel; }
       else { tpLevel=tpPct>0?entry*(1-tpPct/100):NaN; slLevel=slPct>0?entry*(1+slPct/100):NaN; hitTp=Number.isFinite(tpLevel)&&lo<=tpLevel; hitSl=Number.isFinite(slLevel)&&hi>=slLevel; }
-      const side=_resolveHitSide(hitTp,hitSl,tpLevel,slLevel,entry);
+      const side=_resolveHitSide(hitTp,hitSl,tpLevel,slLevel,entry,ambiguousBarPolicy);
       if (side==='tp') { tpIdx.push(i); tpPrice.push(tpLevel); pos=0; entry=NaN; }
       else if (side==='sl') { slIdx.push(i); slPrice.push(slLevel); pos=0; entry=NaN; }
     }
     return {tpIdx,tpPrice,slIdx,slPrice};
   }
 
-  // v8.5-fix: TP/SL liczy od avgPrice, sprawdza od świecy NASTĘPNEJ po entry
-  function computeAtrBasedTpSl(candles, signals, atr, tpAtrMult, slAtrMult) {
+  // v8.6.2-fix: TP/SL preview aware of management closes
+  function computeAtrBasedTpSl(candles, signals, atr, tpAtrMult, slAtrMult, managementCloses, ambiguousBarPolicy) {
     const tpIdx=[],tpPrice=[],slIdx=[],slPrice=[];
     if (!candles.length||!atr.length) return {tpIdx,tpPrice,slIdx,slPrice};
+    const mgmtSet = new Set(Array.isArray(managementCloses) ? managementCloses : []);
     let pos=0,entry=NaN,entryAtr=NaN,entryBar=-1,sigPtr=0;
     for (let i=0;i<candles.length;i++) {
       while (sigPtr<signals.length&&signals[sigPtr].idx===i) {
@@ -636,6 +652,8 @@
         sigPtr++;
       }
       if (!pos||!Number.isFinite(entry)||!Number.isFinite(entryAtr)) continue;
+      // v8.6.2-fix: if management close happened on this bar, exit position in preview
+      if (mgmtSet.has(i)) { pos=0; entry=NaN; entryAtr=NaN; continue; }
       // v8.5-fix: nie sprawdzaj TP/SL na świecy wejścia
       if (i<=entryBar) continue;
       const hi=Number(candles[i].high),lo=Number(candles[i].low);
@@ -643,21 +661,24 @@
       let tpLevel,slLevel,hitTp,hitSl;
       if (pos===1) { tpLevel=entry+entryAtr*tpAtrMult; slLevel=entry-entryAtr*slAtrMult; hitTp=hi>=tpLevel; hitSl=lo<=slLevel; }
       else { tpLevel=entry-entryAtr*tpAtrMult; slLevel=entry+entryAtr*slAtrMult; hitTp=lo<=tpLevel; hitSl=hi>=slLevel; }
-      const side=_resolveHitSide(hitTp,hitSl,tpLevel,slLevel,entry);
+      const side=_resolveHitSide(hitTp,hitSl,tpLevel,slLevel,entry,ambiguousBarPolicy);
       if (side==='tp') { tpIdx.push(i); tpPrice.push(tpLevel); pos=0; entry=NaN; entryAtr=NaN; }
       else if (side==='sl') { slIdx.push(i); slPrice.push(slLevel); pos=0; entry=NaN; entryAtr=NaN; }
     }
     return {tpIdx,tpPrice,slIdx,slPrice};
   }
 
-  // v8.5-fix: sprawdza od świecy NASTĘPNEJ po entry
-  function computeFvgCloudTpSl(candles, signals, fvgDir, cloudBull) {
+  // v8.6.2-fix: TP/SL preview aware of management closes
+  function computeFvgCloudTpSl(candles, signals, fvgDir, cloudBull, managementCloses) {
     const tpIdx=[],tpPrice=[],slIdx=[],slPrice=[];
     if (!candles.length||!Array.isArray(fvgDir)||!Array.isArray(cloudBull)) return {tpIdx,tpPrice,slIdx,slPrice};
+    const mgmtSet = new Set(Array.isArray(managementCloses) ? managementCloses : []);
     let pos=0,aligned=false,entryBar=-1,sigPtr=0;
     for (let i=0;i<candles.length;i++) {
       while (sigPtr<signals.length&&signals[sigPtr].idx===i) { pos=signals[sigPtr].dir; aligned=Number(fvgDir[i])===pos; entryBar=i; sigPtr++; }
       if (!pos) continue;
+      // v8.6.2-fix: if management close happened on this bar, exit position in preview
+      if (mgmtSet.has(i)) { pos=0; aligned=false; continue; }
       // v8.5-fix: nie sprawdzaj TP/SL na świecy wejścia
       if (i<=entryBar) continue;
       const fNow=Number(fvgDir[i]),fPrev=Number(i>0?fvgDir[i-1]:fNow);
@@ -681,6 +702,7 @@
       lastAddBar: -1e9,
       addsInDir: 0,
       lastAddPrice: NaN,
+      lastAddAtr: NaN,
       positionAvgPrice: NaN,
       positionUnits: 0,
       protectiveStop: NaN,
@@ -697,6 +719,7 @@
       lastAddBar: state.lastAddBar,
       addsInDir: state.addsInDir,
       lastAddPrice: state.lastAddPrice,
+      lastAddAtr: state.lastAddAtr,
       positionAvgPrice: state.positionAvgPrice,
       positionUnits: state.positionUnits,
       protectiveStop: state.protectiveStop,
@@ -714,6 +737,7 @@
     state.lastAddBar = -1e9;
     state.addsInDir = 0;
     state.lastAddPrice = NaN;
+    state.lastAddAtr = NaN;
     state.positionAvgPrice = NaN;
     state.positionUnits = 0;
     state.protectiveStop = NaN;
@@ -722,7 +746,20 @@
     state.lastManagementBar = -1e9;
   }
 
-  function registerEntry(state, dir, entryPrice, barIdx) {
+  // v8.6.2-fix: clear position data only, preserve execution/management timers for cooldown
+  function clearPositionOnly(state) {
+    state.currentSide = 0;
+    state.entryBar = -1;
+    state.lastAddBar = -1e9;
+    state.addsInDir = 0;
+    state.lastAddPrice = NaN;
+    state.lastAddAtr = NaN;
+    state.positionAvgPrice = NaN;
+    state.positionUnits = 0;
+    state.protectiveStop = NaN;
+  }
+
+  function registerEntry(state, dir, entryPrice, barIdx, atrVal) {
     if (!(dir === 1 || dir === -1) || !Number.isFinite(entryPrice)) return;
     if (state.currentSide !== dir || state.positionUnits <= 0 || !Number.isFinite(state.positionAvgPrice)) {
       state.currentSide = dir;
@@ -730,6 +767,7 @@
       state.lastAddBar = barIdx;
       state.addsInDir = 0;
       state.lastAddPrice = entryPrice;
+      state.lastAddAtr = Number.isFinite(atrVal) ? atrVal : NaN;
       state.positionAvgPrice = entryPrice;
       state.positionUnits = 1;
       state.protectiveStop = NaN;
@@ -740,6 +778,7 @@
     state.positionUnits = oldUnits + 1;
     state.lastAddBar = barIdx;
     state.lastAddPrice = entryPrice;
+    state.lastAddAtr = Number.isFinite(atrVal) ? atrVal : state.lastAddAtr;
     state.addsInDir += 1;
   }
 
@@ -782,18 +821,18 @@
     return             Number.isFinite(high[i]) && high[i] >= emaFast[i];
   }
 
-  function computeBreakoutOk(dir, closePrice, refPrice, state) {
-    if (!Number.isFinite(closePrice)) return false;
-    const anchor = Number.isFinite(state.lastAddPrice) ? state.lastAddPrice : refPrice;
-    if (!Number.isFinite(anchor)) return false;
-    return dir === 1 ? closePrice > anchor : closePrice < anchor;
+  // v8.6.2-fix: use structural refPrice as anchor, not lastAddPrice
+  function computeBreakoutOk(dir, executionPrice, refPrice) {
+    if (!Number.isFinite(executionPrice) || !Number.isFinite(refPrice)) return false;
+    return dir === 1 ? executionPrice > refPrice : executionPrice < refPrice;
   }
 
+  // v8.6.2-fix: use lastAddAtr (ATR at time of last add) instead of current ATR
   function computeDistanceOk(executionPrice, atrVal, state, cfg) {
     if (!(cfg.minDistanceFromLastAddAtr > 0) || !Number.isFinite(state.lastAddPrice)) return true;
-    const a = Number(atrVal);
-    if (!Number.isFinite(a) || a <= 0) return true;
-    return Math.abs(Number(executionPrice) - state.lastAddPrice) >= a * cfg.minDistanceFromLastAddAtr;
+    const refAtr = Number.isFinite(state.lastAddAtr) ? state.lastAddAtr : Number(atrVal);
+    if (!Number.isFinite(refAtr) || refAtr <= 0) return true;
+    return Math.abs(Number(executionPrice) - state.lastAddPrice) >= refAtr * cfg.minDistanceFromLastAddAtr;
   }
 
   function computeTightenedStop(state, dir, i, close, atr, cfg) {
@@ -869,6 +908,12 @@
       slPercent:    clampNum(readNum(getEl('turboSlPercent'),  DEFAULTS.slPercent),  0.05, 3,  DEFAULTS.slPercent),
       tpAtrMult:    clampNum(readNum(getEl('turboTpAtrMult'),  DEFAULTS.tpAtrMult),  0.5,  5,  DEFAULTS.tpAtrMult),
       slAtrMult:    clampNum(readNum(getEl('turboSlAtrMult'),  DEFAULTS.slAtrMult),  0.3,  3,  DEFAULTS.slAtrMult),
+      ambiguousBarPolicy: (function() {
+        const v = String(getEl('turboAmbiguousBarPolicy')?.value || '').toLowerCase().replace(/[_\s-]/g, '');
+        if (v === 'conservative') return 'conservative';
+        if (v === 'optimistic') return 'optimistic';
+        return DEFAULTS.ambiguousBarPolicy;
+      })(),
       useMarketRegime:    readBool(getEl('turboUseMarketRegime'),   DEFAULTS.useMarketRegime),
       regimeAdxTrend,
       regimeAdxChop,
@@ -1037,30 +1082,43 @@
           if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'reversePolicy:ignoreOppositeUntilExit' }, blockedBase), cfg.debugMaxRecords);
           continue;
         }
-        // v8.5-fix: usunięty resolveEntryPrice wrapper
-        const { entryPrice: mgmtPrice } = resolveEntry(cfg.entryMode, i, open, high, low, close);
+        // v8.6.2-fix: use both mgmtPrice and mgmtIdx from resolveEntry
+        const { entryPrice: mgmtPrice, entryIdx: mgmtIdx } = resolveEntry(cfg.entryMode, i, open, high, low, close);
         if (cfg.reversePolicy === 'closeThenWait') {
-          manageIdx.push(i); managePrice.push(mgmtPrice); manageAction.push('closeThenWait');
+          manageIdx.push(mgmtIdx); managePrice.push(mgmtPrice); manageAction.push('closeThenWait');
           manageMeta.push({ fromSide: state.currentSide, toSide: dir, stateBefore: cloneState(state) });
           if (cfg.debugSignals) pushDebug(debugSignals, Object.assign({ action: 'closeThenWait', entryPrice: mgmtPrice }, blockedBase), cfg.debugMaxRecords);
-          resetPositionState(state);
-          state.lastManagementBar = i;
+          // v8.6.2-fix: clearPositionOnly keeps lastExecutionBar/lastManagementBar for cooldown
+          clearPositionOnly(state);
+          state.lastManagementBar = mgmtIdx;
+          state.lastExecutionBar = mgmtIdx;
           continue;
         }
         if (cfg.reversePolicy === 'reduceOnly') {
-          manageIdx.push(i); managePrice.push(mgmtPrice); manageAction.push('reduceOnly');
+          manageIdx.push(mgmtIdx); managePrice.push(mgmtPrice); manageAction.push('reduceOnly');
           manageMeta.push({ fromSide: state.currentSide, toSide: dir, stateBefore: cloneState(state) });
           if (state.positionUnits > 1) {
             state.positionUnits -= 1;
             state.addsInDir  = Math.max(0, state.addsInDir - 1);
-            state.lastAddBar = i;
+            state.lastAddBar = mgmtIdx;
             state.lastAddPrice = mgmtPrice;
           } else {
-            resetPositionState(state);
+            clearPositionOnly(state);
           }
-          state.lastManagementBar = i;
+          state.lastManagementBar = mgmtIdx;
+          state.lastExecutionBar = mgmtIdx;
           if (cfg.debugSignals) pushDebug(debugSignals, Object.assign({ action: 'reduceOnly', entryPrice: mgmtPrice }, blockedBase), cfg.debugMaxRecords);
           continue;
+        }
+        // v8.6.2-fix: reverseImmediately — close old position, then immediately open new one (bypass old cooldown)
+        if (cfg.reversePolicy === 'reverseImmediately' || !cfg.reversePolicy) {
+          manageIdx.push(mgmtIdx); managePrice.push(mgmtPrice); manageAction.push('reverseClose');
+          manageMeta.push({ fromSide: state.currentSide, toSide: dir, stateBefore: cloneState(state) });
+          if (cfg.debugSignals) pushDebug(debugSignals, Object.assign({ action: 'reverseClose', entryPrice: mgmtPrice }, blockedBase), cfg.debugMaxRecords);
+          clearPositionOnly(state);
+          // Do NOT set lastExecutionBar here — let the new entry go through without old-position cooldown blocking it
+          state.lastManagementBar = mgmtIdx;
+          // Fall through to normal entry processing below (scoring, ADX filter, etc.)
         }
       }
 
@@ -1113,7 +1171,7 @@
           }
         }
         // ─────────────────────────────────────────────────────────────────────
-        if (cfg.addOnlyIfBreakout && !computeBreakoutOk(dir, pendingEntryPrice, refPrice, state)) {
+        if (cfg.addOnlyIfBreakout && !computeBreakoutOk(dir, pendingEntryPrice, refPrice)) {
           if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'sameSide:addOnlyIfBreakout' }, blockedBase), cfg.debugMaxRecords);
           continue;
         }
@@ -1202,7 +1260,7 @@
       const entryIdx   = pendingEntryIdx;
 
       const wasSameSide = dir === state.currentSide && state.positionUnits > 0;
-      registerEntry(state, dir, entryPrice, entryIdx);
+      registerEntry(state, dir, entryPrice, entryIdx, atr[entryIdx]);
 
       // v8.5: zapisz avgPrice i units PO registerEntry — TP/SL dostanie aktualny stan
       if (dir === 1) {
@@ -1233,16 +1291,30 @@
 
     const signals = buildSignalList(buyIdx, sellIdx, buyPrice, sellPrice, close, buyAvgPrice, sellAvgPrice, buyUnits, sellUnits);
 
+    // v8.6.2-fix: collect bar indices where management actions fully close the position
+    // so that TP/SL preview knows to exit the position at those points
+    const managementCloses = [];
+    for (let m = 0; m < manageAction.length; m++) {
+      if (manageAction[m] === 'closeThenWait' || manageAction[m] === 'reverseClose') {
+        managementCloses.push(manageIdx[m]);
+      } else if (manageAction[m] === 'reduceOnly' && manageMeta[m] && manageMeta[m].stateBefore) {
+        // reduceOnly closes the position only if it was the last unit
+        if (manageMeta[m].stateBefore.positionUnits <= 1) {
+          managementCloses.push(manageIdx[m]);
+        }
+      }
+    }
+
     if (tpMode === 'classic') {
-      const r = computeClassicTpSl(candles, signals, cfg.tpPercent, cfg.slPercent);
+      const r = computeClassicTpSl(candles, signals, cfg.tpPercent, cfg.slPercent, managementCloses, cfg.ambiguousBarPolicy);
       ({ tpIdx, tpPrice, slIdx, slPrice } = r);
     } else if (tpMode === 'atrBased') {
-      const r = computeAtrBasedTpSl(candles, signals, atr, cfg.tpAtrMult, cfg.slAtrMult);
+      const r = computeAtrBasedTpSl(candles, signals, atr, cfg.tpAtrMult, cfg.slAtrMult, managementCloses, cfg.ambiguousBarPolicy);
       ({ tpIdx, tpPrice, slIdx, slPrice } = r);
     } else if (tpMode === 'fvgCloud') {
       const fvgDir    = computeFvgDir(high, low, close, cfg.fvgLen, cfg.fvgSmoothLen);
       const cloudBull = computeCloudBull(close, cfg.cloudFastPeriod, cfg.cloudFastMethod, cfg.cloudSlowPeriod, cfg.cloudSlowMethod);
-      const r = computeFvgCloudTpSl(candles, signals, fvgDir, cloudBull);
+      const r = computeFvgCloudTpSl(candles, signals, fvgDir, cloudBull, managementCloses);
       ({ tpIdx, tpPrice, slIdx, slPrice } = r);
     }
 
@@ -1268,6 +1340,15 @@
         minScore:                 cfg.minScore,
         minTriggerScore:          cfg.minTriggerScore,
         warmupBars:               cfg.warmupBars,
+        cooldown:                 cfg.cooldown,
+        adxMin:                   cfg.adxMin,
+        useMarketRegime:          cfg.useMarketRegime,
+        ambiguousBarPolicy:       cfg.ambiguousBarPolicy,
+        tpSystem:                 cfg.tpSystem,
+        tpPercent:                cfg.tpPercent,
+        slPercent:                cfg.slPercent,
+        tpAtrMult:                cfg.tpAtrMult,
+        slAtrMult:                cfg.slAtrMult,
         rsiMid:                   cfg.rsiMid,
         rsiExtreme:               cfg.rsiExtreme
       }
