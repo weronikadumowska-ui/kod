@@ -55,6 +55,11 @@
     addOnlyIfPullback: false,
     addOnlyIfBreakout: false,
     minDistanceFromLastAddAtr: 0.5,
+    addRequireImpulseConfirm: true,   // S-tier #2: add tylko po pullbacku + re-impuls (close w kierunku trendu)
+
+    // --- Breakout quality (S-tier #1) ---
+    minDistanceBreakout: 0.1,  // minimalna odległość close od microHigh/microLow w jednostkach ATR
+    maxExtDistATR: 3.0,        // max rozciągnięcie close od EMA/VWAP w jednostkach ATR (0 = wyłączone)
 
     // --- TP/SL ---
     tpSystem: 'atrBased',
@@ -845,6 +850,9 @@
       addOnlyIfPullback:        readBool(getEl('turboAddOnlyIfPullback'),  DEFAULTS.addOnlyIfPullback),
       addOnlyIfBreakout:        readBool(getEl('turboAddOnlyIfBreakout'),  DEFAULTS.addOnlyIfBreakout),
       minDistanceFromLastAddAtr:clampNum(readNum(getEl('turboMinDistanceFromLastAddAtr'),DEFAULTS.minDistanceFromLastAddAtr),0,5,DEFAULTS.minDistanceFromLastAddAtr),
+      addRequireImpulseConfirm: readBool(getEl('turboAddRequireImpulseConfirm'), DEFAULTS.addRequireImpulseConfirm),
+      minDistanceBreakout:      clampNum(readNum(getEl('turboMinDistanceBreakout'),   DEFAULTS.minDistanceBreakout),   0, 5,  DEFAULTS.minDistanceBreakout),
+      maxExtDistATR:            clampNum(readNum(getEl('turboMaxExtDistATR'),         DEFAULTS.maxExtDistATR),         0, 20, DEFAULTS.maxExtDistATR),
       debugSignals:             readBool(getEl('turboDebugSignals'),    DEFAULTS.debugSignals),
       debugMaxRecords:          clampInt(readNum(getEl('turboDebugMaxRecords'),DEFAULTS.debugMaxRecords),0,200000,DEFAULTS.debugMaxRecords),
       entryMode, tpSystem,
@@ -957,6 +965,41 @@
 
       const blockedBase = { idx: i, dir, price: close[i], state: cloneState(state), regime: regime[i] };
 
+      // ─── S-tier upgrade #1: Warunki jakościowe breakoutu ─────────────────────
+      // a) Zamknięcie musi wyraźnie przełamać poziom (co najmniej minDistanceBreakout * ATR)
+      if (cfg.minDistanceBreakout > 0 && Number.isFinite(atr[i]) && atr[i] > 0) {
+        const breakDist = dir === 1 ? close[i] - refPrice : refPrice - close[i];
+        if (breakDist < cfg.minDistanceBreakout * atr[i]) {
+          if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'breakout:minDistanceBreakout', breakDist, required: cfg.minDistanceBreakout * atr[i] }, blockedBase), cfg.debugMaxRecords);
+          continue;
+        }
+      }
+
+      // b) Body świecy musi obejmować wybicie (knot za poziomem nie wystarczy — open musi być po drugiej stronie)
+      {
+        const bodyEncompassesBreakout = dir === 1
+          ? (Math.min(open[i], close[i]) <= refPrice && close[i] > refPrice)
+          : (Math.max(open[i], close[i]) >= refPrice && close[i] < refPrice);
+        if (!bodyEncompassesBreakout) {
+          if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'breakout:bodyMustEncompass', open: open[i], close: close[i], refPrice }, blockedBase), cfg.debugMaxRecords);
+          continue;
+        }
+      }
+
+      // c) Close nie może być zbyt rozciągnięty od EMA lub VWAP (|close - EMA/VWAP| ≤ maxExtDistATR * ATR)
+      if (cfg.maxExtDistATR > 0 && Number.isFinite(atr[i]) && atr[i] > 0) {
+        const maxDist = cfg.maxExtDistATR * atr[i];
+        if (Number.isFinite(emaFast[i]) && Math.abs(close[i] - emaFast[i]) > maxDist) {
+          if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'breakout:tooFarFromEMA', distEMA: Math.abs(close[i] - emaFast[i]), maxDist }, blockedBase), cfg.debugMaxRecords);
+          continue;
+        }
+        if (cfg.useVWAP && Number.isFinite(vwap[i]) && vwap[i] > 0 && Math.abs(close[i] - vwap[i]) > maxDist) {
+          if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'breakout:tooFarFromVWAP', distVWAP: Math.abs(close[i] - vwap[i]), maxDist }, blockedBase), cfg.debugMaxRecords);
+          continue;
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────────
+
       const { entryPrice: pendingEntryPrice, entryIdx: pendingEntryIdx } =
         resolveEntry(cfg.entryMode, i, open, high, low, close);
       if (!Number.isFinite(pendingEntryPrice)) {
@@ -1040,6 +1083,16 @@
           if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'sameSide:addOnlyIfPullback' }, blockedBase), cfg.debugMaxRecords);
           continue;
         }
+        // ─── S-tier upgrade #2: Re-impuls po pullbacku ───────────────────────
+        // Świeca bieżąca musi zamknąć się zgodnie z kierunkiem trendu (close > open dla longa, close < open dla shorta)
+        if (cfg.addRequireImpulseConfirm) {
+          const impulseOk = dir === 1 ? close[i] > open[i] : close[i] < open[i];
+          if (!impulseOk) {
+            if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'sameSide:addNoImpulseConfirm', open: open[i], close: close[i] }, blockedBase), cfg.debugMaxRecords);
+            continue;
+          }
+        }
+        // ─────────────────────────────────────────────────────────────────────
         if (cfg.addOnlyIfBreakout && !computeBreakoutOk(dir, pendingEntryPrice, refPrice, state)) {
           if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'sameSide:addOnlyIfBreakout' }, blockedBase), cfg.debugMaxRecords);
           continue;
@@ -1185,6 +1238,9 @@
         addOnlyIfPullback:        cfg.addOnlyIfPullback,
         addOnlyIfBreakout:        cfg.addOnlyIfBreakout,
         minDistanceFromLastAddAtr:cfg.minDistanceFromLastAddAtr,
+        addRequireImpulseConfirm: cfg.addRequireImpulseConfirm,
+        minDistanceBreakout:      cfg.minDistanceBreakout,
+        maxExtDistATR:            cfg.maxExtDistATR,
         rsiMid:                   cfg.rsiMid,
         rsiExtreme:               cfg.rsiExtreme
       }
