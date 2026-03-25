@@ -1,6 +1,13 @@
 // TURBO 1M — Ultra-fast indicator for 1-minute candles (normal candles, NOT Heikin-Ashi)
-// v8.6.1 — audit-fix: lastMH/lastML independent (no longer both required); volume NaN preserved (not coerced to 0); pullback uses only low/high wick
-// v8.6 — S-tier: quality breakout (body+minDist+maxExt), add impulse confirm; v8.5: TP/SL od i+1, reset state pełny, NaN=0 w scoringu
+// v8.6.2 — audit-fix: 5 bugs fixed (see below)
+//   #1 closeThenWait/reduceOnly: preserve lastExecutionBar after reset → cooldown enforced after close
+//   #2 reverseImmediately: bypass cooldown (reversal should be instant by design)
+//   #3 closeThenWait/reduceOnly: manageIdx/lastManagementBar use execution bar (mgmtIdx), not decision bar i
+//   #4 minDistanceFromLastAddAtr: use lastAddAtr (ATR at add time) instead of current ATR
+//   #5 debugConfig: add missing filter params (cooldown, adxMin, adxLen, swingLen, breakByClose)
+// v8.6.1 — audit-fix: lastMH/lastML independent; volume NaN preserved; pullback uses wick only
+// v8.6 — S-tier: quality breakout (body+minDist+maxExt), add impulse confirm
+// v8.5 — TP/SL from i+1, full state reset, NaN=0 in scoring
 (function () {
   'use strict';
 
@@ -681,6 +688,7 @@
       lastAddBar: -1e9,
       addsInDir: 0,
       lastAddPrice: NaN,
+      lastAddAtr: NaN,   // audit-fix #4: ATR at time of last add, for minDistanceFromLastAddAtr
       positionAvgPrice: NaN,
       positionUnits: 0,
       protectiveStop: NaN,
@@ -697,6 +705,7 @@
       lastAddBar: state.lastAddBar,
       addsInDir: state.addsInDir,
       lastAddPrice: state.lastAddPrice,
+      lastAddAtr: state.lastAddAtr,
       positionAvgPrice: state.positionAvgPrice,
       positionUnits: state.positionUnits,
       protectiveStop: state.protectiveStop,
@@ -714,6 +723,7 @@
     state.lastAddBar = -1e9;
     state.addsInDir = 0;
     state.lastAddPrice = NaN;
+    state.lastAddAtr = NaN;
     state.positionAvgPrice = NaN;
     state.positionUnits = 0;
     state.protectiveStop = NaN;
@@ -722,7 +732,9 @@
     state.lastManagementBar = -1e9;
   }
 
-  function registerEntry(state, dir, entryPrice, barIdx) {
+  // atrVal: ATR value at the time of entry — stored as lastAddAtr so that
+  // computeDistanceOk can use the ATR from the add bar instead of the current bar (audit-fix #4).
+  function registerEntry(state, dir, entryPrice, barIdx, atrVal) {
     if (!(dir === 1 || dir === -1) || !Number.isFinite(entryPrice)) return;
     if (state.currentSide !== dir || state.positionUnits <= 0 || !Number.isFinite(state.positionAvgPrice)) {
       state.currentSide = dir;
@@ -730,6 +742,7 @@
       state.lastAddBar = barIdx;
       state.addsInDir = 0;
       state.lastAddPrice = entryPrice;
+      state.lastAddAtr = Number.isFinite(atrVal) ? atrVal : NaN; // audit-fix #4
       state.positionAvgPrice = entryPrice;
       state.positionUnits = 1;
       state.protectiveStop = NaN;
@@ -740,6 +753,7 @@
     state.positionUnits = oldUnits + 1;
     state.lastAddBar = barIdx;
     state.lastAddPrice = entryPrice;
+    state.lastAddAtr = Number.isFinite(atrVal) ? atrVal : NaN; // audit-fix #4
     state.addsInDir += 1;
   }
 
@@ -791,9 +805,12 @@
 
   function computeDistanceOk(executionPrice, atrVal, state, cfg) {
     if (!(cfg.minDistanceFromLastAddAtr > 0) || !Number.isFinite(state.lastAddPrice)) return true;
-    const a = Number(atrVal);
-    if (!Number.isFinite(a) || a <= 0) return true;
-    return Math.abs(Number(executionPrice) - state.lastAddPrice) >= a * cfg.minDistanceFromLastAddAtr;
+    // audit-fix #4: prefer ATR recorded at the time of the last add (lastAddAtr); fall back to
+    // the current bar's ATR only when lastAddAtr is unavailable.
+    // Using current ATR can spike on volatile bars and block all further adds unfairly.
+    const raw = Number.isFinite(state.lastAddAtr) && state.lastAddAtr > 0 ? state.lastAddAtr : Number(atrVal);
+    if (!Number.isFinite(raw) || raw <= 0) return true;
+    return Math.abs(Number(executionPrice) - state.lastAddPrice) >= raw * cfg.minDistanceFromLastAddAtr;
   }
 
   function computeTightenedStop(state, dir, i, close, atr, cfg) {
@@ -1037,28 +1054,34 @@
           if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'reversePolicy:ignoreOppositeUntilExit' }, blockedBase), cfg.debugMaxRecords);
           continue;
         }
-        // v8.5-fix: usunięty resolveEntryPrice wrapper
-        const { entryPrice: mgmtPrice } = resolveEntry(cfg.entryMode, i, open, high, low, close);
+        // audit-fix #3: capture mgmtIdx from resolveEntry so manageIdx records the actual execution bar,
+        // not the decision bar `i` (they differ in nextOpen/nextMid modes).
+        const { entryPrice: mgmtPrice, entryIdx: mgmtIdx } = resolveEntry(cfg.entryMode, i, open, high, low, close);
         if (cfg.reversePolicy === 'closeThenWait') {
-          manageIdx.push(i); managePrice.push(mgmtPrice); manageAction.push('closeThenWait');
+          manageIdx.push(mgmtIdx); managePrice.push(mgmtPrice); manageAction.push('closeThenWait');
           manageMeta.push({ fromSide: state.currentSide, toSide: dir, stateBefore: cloneState(state) });
           if (cfg.debugSignals) pushDebug(debugSignals, Object.assign({ action: 'closeThenWait', entryPrice: mgmtPrice }, blockedBase), cfg.debugMaxRecords);
           resetPositionState(state);
-          state.lastManagementBar = i;
+          // audit-fix #1: preserve lastExecutionBar after reset so the cooldown is enforced on the
+          // next signal — without this, lastExecutionBar = -1e9 and the cooldown is bypassed entirely.
+          state.lastExecutionBar = mgmtIdx;
+          state.lastManagementBar = mgmtIdx;
           continue;
         }
         if (cfg.reversePolicy === 'reduceOnly') {
-          manageIdx.push(i); managePrice.push(mgmtPrice); manageAction.push('reduceOnly');
+          manageIdx.push(mgmtIdx); managePrice.push(mgmtPrice); manageAction.push('reduceOnly');
           manageMeta.push({ fromSide: state.currentSide, toSide: dir, stateBefore: cloneState(state) });
           if (state.positionUnits > 1) {
             state.positionUnits -= 1;
             state.addsInDir  = Math.max(0, state.addsInDir - 1);
-            state.lastAddBar = i;
+            state.lastAddBar = mgmtIdx;
             state.lastAddPrice = mgmtPrice;
           } else {
             resetPositionState(state);
+            // audit-fix #1: same cooldown-preservation for reduceOnly full-close path
+            state.lastExecutionBar = mgmtIdx;
           }
-          state.lastManagementBar = i;
+          state.lastManagementBar = mgmtIdx;
           if (cfg.debugSignals) pushDebug(debugSignals, Object.assign({ action: 'reduceOnly', entryPrice: mgmtPrice }, blockedBase), cfg.debugMaxRecords);
           continue;
         }
@@ -1123,7 +1146,10 @@
         }
       }
 
-      if ((pendingEntryIdx - state.lastExecutionBar) < cfg.cooldown) {
+      // audit-fix #2: reverseImmediately should bypass cooldown — it is meant to be instant.
+      // Cooldown only applies to new entries and same-side adds, not to an immediate reversal.
+      const isImmediateReversal = state.currentSide !== 0 && dir !== state.currentSide && cfg.reversePolicy === 'reverseImmediately';
+      if (!isImmediateReversal && (pendingEntryIdx - state.lastExecutionBar) < cfg.cooldown) {
         if (cfg.debugSignals) pushDebug(debugBlocked, Object.assign({ reason: 'cooldown' }, blockedBase), cfg.debugMaxRecords);
         continue;
       }
@@ -1202,7 +1228,7 @@
       const entryIdx   = pendingEntryIdx;
 
       const wasSameSide = dir === state.currentSide && state.positionUnits > 0;
-      registerEntry(state, dir, entryPrice, entryIdx);
+      registerEntry(state, dir, entryPrice, entryIdx, atr[i]); // audit-fix #4: pass current ATR to store as lastAddAtr
 
       // v8.5: zapisz avgPrice i units PO registerEntry — TP/SL dostanie aktualny stan
       if (dir === 1) {
@@ -1268,6 +1294,11 @@
         minScore:                 cfg.minScore,
         minTriggerScore:          cfg.minTriggerScore,
         warmupBars:               cfg.warmupBars,
+        cooldown:                 cfg.cooldown,      // audit-fix #5: was missing
+        adxMin:                   cfg.adxMin,        // audit-fix #5: was missing
+        adxLen:                   cfg.adxLen,        // audit-fix #5: was missing
+        swingLen:                 cfg.swingLen,      // audit-fix #5: was missing
+        breakByClose:             cfg.breakByClose,  // audit-fix #5: was missing
         rsiMid:                   cfg.rsiMid,
         rsiExtreme:               cfg.rsiExtreme
       }
