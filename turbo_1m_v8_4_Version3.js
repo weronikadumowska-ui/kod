@@ -1,5 +1,5 @@
 // TURBO 1M — Ultra-fast indicator for 1-minute candles (normal candles, NOT Heikin-Ashi)
-// v8.5 — fixy: TP/SL od i+1, reset state pełny, TP/SL z avgPrice, NaN=0 w scoringu
+// v8.6 — S-tier: quality breakout (body+minDist+maxExt), add impulse confirm; v8.5: TP/SL od i+1, reset state pełny, NaN=0 w scoringu
 (function () {
   'use strict';
 
@@ -842,8 +842,10 @@
       fibA: Math.min(fibA, fibB),
       fibB: Math.max(fibA, fibB),
       fibLookback:  clampInt(readNum(getEl('turboFibLookback'), DEFAULTS.fibLookback), 20, 500, DEFAULTS.fibLookback),
-      minScore:     clampNum(readNum(getEl('turboMinScore'),    DEFAULTS.minScore),    1,  12,  DEFAULTS.minScore),
-      cooldown:     clampInt(readNum(getEl('turboCooldown'),    DEFAULTS.cooldown),    0,  20,  DEFAULTS.cooldown),
+      minScore:         clampNum(readNum(getEl('turboMinScore'),         DEFAULTS.minScore),         1,    12,     DEFAULTS.minScore),
+      minTriggerScore:  clampNum(readNum(getEl('turboMinTriggerScore'),  DEFAULTS.minTriggerScore),  0,    12,     DEFAULTS.minTriggerScore),
+      warmupBars:       clampInt(readNum(getEl('turboWarmupBars'),       DEFAULTS.warmupBars),       0,    10000,  DEFAULTS.warmupBars),
+      cooldown:         clampInt(readNum(getEl('turboCooldown'),         DEFAULTS.cooldown),         0,    20,     DEFAULTS.cooldown),
       sameSidePolicy,
       maxAdds:               clampInt(readNum(getEl('turboMaxAdds'),               DEFAULTS.maxAdds),               0, 5,  DEFAULTS.maxAdds),
       minBarsBetweenAdds:    clampInt(readNum(getEl('turboMinBarsBetweenAdds'),    DEFAULTS.minBarsBetweenAdds),    1, 50, DEFAULTS.minBarsBetweenAdds),
@@ -1251,6 +1253,9 @@
         addRequireImpulseConfirm: cfg.addRequireImpulseConfirm,
         minDistanceBreakout:      cfg.minDistanceBreakout,
         maxExtDistATR:            cfg.maxExtDistATR,
+        minScore:                 cfg.minScore,
+        minTriggerScore:          cfg.minTriggerScore,
+        warmupBars:               cfg.warmupBars,
         rsiMid:                   cfg.rsiMid,
         rsiExtreme:               cfg.rsiExtreme
       }
